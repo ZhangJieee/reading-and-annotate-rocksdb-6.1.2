@@ -545,7 +545,7 @@ ColumnFamilyOptions* ColumnFamilyOptions::OptimizeUniversalStyleCompaction(
   return this;
 }
 
-//rocksdb_options_increase_parallelism  ÉèÖÃjobÏß³ÌÊý
+//rocksdb_options_increase_parallelism  ï¿½ï¿½ï¿½ï¿½jobï¿½ß³ï¿½ï¿½ï¿½
 DBOptions* DBOptions::IncreaseParallelism(int total_threads) {
   max_background_jobs = total_threads;
   env->SetBackgroundThreads(total_threads, Env::LOW);

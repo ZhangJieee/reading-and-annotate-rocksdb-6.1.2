@@ -1722,10 +1722,13 @@ BlockBasedTable::CachableEntry<FilterBlockReader> BlockBasedTable::GetFilter(
     // Do not invoke any io.
     return CachableEntry<FilterBlockReader>();
   } else {
+    //SST中读Filter Block
     filter = ReadFilter(prefetch_buffer, filter_blk_handle,
                         is_a_filter_partition, prefix_extractor);
     if (filter != nullptr) {
       size_t usage = filter->ApproximateMemoryUsage();
+
+      // 写block cache
       Status s = block_cache->Insert(
           key, filter, usage, &DeleteCachedFilterEntry, &cache_handle,
           rep_->table_options.cache_index_and_filter_blocks_with_high_priority
@@ -2633,6 +2636,8 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
   Status s;
   const bool no_io = read_options.read_tier == kBlockCacheTier;
   CachableEntry<FilterBlockReader> filter_entry;
+
+  // 先读Filter Block
   if (!skip_filters) {
     filter_entry =
         GetFilter(prefix_extractor, /*prefetch_buffer*/ nullptr,
@@ -2647,6 +2652,8 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_USEFUL);
     PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, 1, rep_->level);
   } else {
+
+      // 如果Filter没有完全匹配，则需要从所有的index block进行逐一Seek
     IndexBlockIter iiter_on_stack;
     // if prefix_extractor found in block differs from options, disable
     // BlockPrefixIndex. Only do this check when index_type is kHashSearch.

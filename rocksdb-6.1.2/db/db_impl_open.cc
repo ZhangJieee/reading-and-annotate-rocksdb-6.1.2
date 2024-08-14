@@ -1079,9 +1079,13 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
+
+  // kDefaultColumnFamilyName = "default"
   std::vector<ColumnFamilyDescriptor> column_families;
   column_families.push_back(
       ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+
+  // 用来存放现有的CF实例
   std::vector<ColumnFamilyHandle*> handles;
   Status s = DB::Open(db_options, dbname, column_families, &handles, dbptr);
   if (s.ok()) {
@@ -1107,11 +1111,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     const std::vector<ColumnFamilyDescriptor>& column_families,
                     std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
                     const bool seq_per_batch, const bool batch_per_txn) {
+  // 配置净化
   Status s = SanitizeOptionsByTable(db_options, column_families);
   if (!s.ok()) {
     return s;
   }
 
+  // 配置验证
   s = ValidateOptions(db_options, column_families);
   if (!s.ok()) {
     return s;
@@ -1120,6 +1126,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   *dbptr = nullptr;
   handles->clear();
 
+  // 每个CF下都会有一个最大内存占用限制，这里取其中的最大值
   size_t max_write_buffer_size = 0;
   for (auto cf : column_families) {
     max_write_buffer_size =
@@ -1131,7 +1138,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 	using std::cout;
 	using std::endl;
   cout << "yang test ..############.. :" << dbname << endl;
-  
+
+  // 创建DB实例
   DBImpl* impl = new DBImpl(db_options, dbname, seq_per_batch, batch_per_txn);
   //创建目录
   s = impl->env_->CreateDirIfMissing(impl->immutable_db_options_.wal_dir);
@@ -1165,13 +1173,19 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     return s;
   }
 
+  // 创建归档目录
   s = impl->CreateArchivalDirectory();
   if (!s.ok()) {
     delete impl;
     return s;
   }
+
+  // LOCK
   impl->mutex_.Lock();
+
+  //设置写生存期
   auto write_hint = impl->CalculateWALWriteHint();
+
   // Handles create_if_missing, error_if_exists
   //锁定并试图做Recover操作。Recover操作用来处理创建flag，比如存在就返回失败等等，尝试从已存在的sstable文件恢复db
   s = impl->Recover(column_families); //DBImpl::Recover
@@ -1181,6 +1195,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   	//VersionSet::LogAndApply，根据edit记录的增量变动生成新的current version，并写入MANIFEST文件。
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     std::unique_ptr<WritableFile> lfile;
+
+    // EnvOptions
     EnvOptions soptions(db_options);
     EnvOptions opt_env_options =
         impl->immutable_db_options_.env->OptimizeForLogWrite(
@@ -1192,6 +1208,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                         opt_env_options);
     if (s.ok()) {
       lfile->SetWriteLifeTimeHint(write_hint);
+
+      // 预分配WAL block cache
       lfile->SetPreallocationBlockSize(
           impl->GetWalPreallocateBlockSize(max_write_buffer_size));
       {
@@ -1201,6 +1219,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         std::unique_ptr<WritableFileWriter> file_writer(
             new WritableFileWriter(std::move(lfile), log_fname, opt_env_options,
                                    impl->env_, nullptr /* stats */, listeners));
+
+        // 这里初始化log::Writer并记录
         impl->logs_.emplace_back(
             new_log_number,
             new log::Writer(
@@ -1216,6 +1236,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         if (cfd != nullptr) {
           handles->push_back(
               new ColumnFamilyHandleImpl(cfd, impl, &impl->mutex_));
+
+          // monitor相关
           impl->NewThreadStatusCfInfo(cfd);
         } else {
           if (db_options.create_missing_column_families) {
@@ -1237,12 +1259,15 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
     if (s.ok()) {
+      //创建 sv_context并install
       SuperVersionContext sv_context(/* create_superversion */ true);
       for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
         impl->InstallSuperVersionAndScheduleWork(
             cfd, &sv_context, *cfd->GetLatestMutableCFOptions());
       }
       sv_context.Clean();
+
+      // 是否使用了单独的写入队列(不写入Memtable)
       if (impl->two_write_queues_) {
         impl->log_write_mutex_.Lock();
       }
@@ -1253,12 +1278,16 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
 	  //删除过期文件
       impl->DeleteObsoleteFiles();
+
+      // 个人理解，文件夹内的文件有变动，持久化文件夹中文件的entry1信息
       s = impl->directories_.GetDbDir()->Fsync();
     }
   }
 
   if (s.ok()) {
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
+
+      //FIFO模式下，判断SST是否都在level-0
       if (cfd->ioptions()->compaction_style == kCompactionStyleFIFO) {
         auto* vstorage = cfd->current()->storage_info();
         for (int i = 1; i < vstorage->num_levels(); ++i) {
@@ -1289,15 +1318,20 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   TEST_SYNC_POINT("DBImpl::Open:Opened");
   Status persist_options_status;
   if (s.ok()) {
-    // Persist RocksDB Options before scheduling the compaction.
+    // Persist RocksDB Options before scheduling the compaction(执行compaction之前持久化RocksDB Options).
     // The WriteOptionsFile() will release and lock the mutex internally.
+    // 这里的release对应的是L1184的LOCK，并在内部有执行了LOCK
     persist_options_status = impl->WriteOptionsFile(
         false /*need_mutex_lock*/, false /*need_enter_write_thread*/);
 
     *dbptr = impl;
     impl->opened_successfully_ = true;
+
+    // Maybe compaction
     impl->MaybeScheduleFlushOrCompaction();
   }
+
+  // UNLOCK
   impl->mutex_.Unlock();
 
 #ifndef ROCKSDB_LITE
@@ -1353,6 +1387,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           persist_options_status.ToString());
     }
   }
+
+  // 开启周期任务，统计数据转存、快照
   if (s.ok()) {
     impl->StartTimedTasks();
   }

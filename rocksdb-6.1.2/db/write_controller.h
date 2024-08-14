@@ -17,7 +17,7 @@ class Env;
 class WriteControllerToken;
 
 // WriteController is controlling write stalls in our write code-path. Write
-// stalls happen when compaction can't keep up with write rate.
+// stalls happen when compaction can't keep up(跟上) with write rate.
 // All of the methods here (including WriteControllerToken's destructors) need
 // to be called while holding DB mutex
 class WriteController {

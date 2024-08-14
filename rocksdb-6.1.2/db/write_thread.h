@@ -404,6 +404,7 @@ class WriteThread {
   //也就是writer链表头，参考WriteThread::CreateMissingNewerLinks
   std::atomic<Writer*> newest_writer_;
 
+  // 指向最新的memtable writer,用于pipelined的时候，将写完WAL的group writers接到这个writer的后方
   // Points to the newest pending memtable writer. Used only when pipelined
   // write is enabled.
   std::atomic<Writer*> newest_memtable_writer_;

@@ -48,6 +48,7 @@ struct SuperVersionContext;
 //图解参考 https://blog.csdn.net/flyqwang/article/details/50096377
 extern const double kIncSlowdownRatio;
 
+// 封装ColumnFamilyData，方便用户来访问CF
 // ColumnFamilyHandleImpl is the class that clients use to access different
 // column families. It has non-trivial destructor, which gets called when client
 // is done using the column family

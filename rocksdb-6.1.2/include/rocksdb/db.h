@@ -861,7 +861,7 @@ class DB {
   // move the files back to the minimum level capable of holding the data set
   // or a given level (specified by non-negative options.target_level).
 
-  
+  // 提供给用户手动compaction的接口
   // Compactkey范围[*begin,*end]的底层存储，删除和被覆盖的版本将会被抛弃  
   // 数据会被重新组织，以减少访问开销  
   // 注：那些不了解底层实现的用户不应该调用该方法。  
@@ -911,6 +911,7 @@ class DB {
   virtual Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& new_options) = 0;
 
+  // 该接口会在当前的thread进行compaction
   // CompactFiles() inputs a list of files specified by file numbers and
   // compacts them to the specified level. Note that the behavior is different
   // from CompactRange() in that CompactFiles() performs the compaction job
@@ -959,6 +960,7 @@ class DB {
   virtual int NumberLevels(ColumnFamilyHandle* column_family) = 0;
   virtual int NumberLevels() { return NumberLevels(DefaultColumnFamily()); }
 
+  // 如果新的memtable没有发生重合，则将其push到最大level
   // Maximum level to which a new compacted memtable is pushed if it
   // does not create overlap.
   virtual int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) = 0;
@@ -966,6 +968,7 @@ class DB {
     return MaxMemCompactionLevel(DefaultColumnFamily());
   }
 
+  // write stall:level-0的文件数达到阈值，停止写
   // Number of files in level-0 that would stop writes.
   virtual int Level0StopWriteTrigger(ColumnFamilyHandle* column_family) = 0;
   virtual int Level0StopWriteTrigger() {
@@ -1015,12 +1018,16 @@ class DB {
   virtual Status FlushWAL(bool /*sync*/) {
     return Status::NotSupported("FlushWAL not implemented");
   }
+
+  //Write()随后执行SyncWAL()不同于Write()的同时设置sync=true:
+  //后者的case中直到sync执行完成才可以看到变更
   // Sync the wal. Note that Write() followed by SyncWAL() is not exactly the
   // same as Write() with sync=true: in the latter case the changes won't be
   // visible until the sync is done.
   // Currently only works if allow_mmap_writes = false in Options.
   virtual Status SyncWAL() = 0;
 
+  // flush的过程上锁
   // Lock the WAL. Also flushes the WAL after locking.
   virtual Status LockWAL() {
     return Status::NotSupported("LockWAL not implemented");

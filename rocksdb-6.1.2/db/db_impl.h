@@ -82,6 +82,7 @@ class DBImpl : public DB {
          const bool seq_per_batch = false, const bool batch_per_txn = true);
   virtual ~DBImpl();
 
+  // 这个using没太理解  FIXME
   using DB::Resume;
   virtual Status Resume() override;
 
@@ -878,6 +879,7 @@ class DBImpl : public DB {
       bool error_if_data_exists_in_logs = false);
 
  private:
+    // 声明友元类，即这些类可直接访问当前类的所有成员
   friend class DB;
   friend class ErrorHandler;
   friend class InternalStats;
@@ -1425,9 +1427,10 @@ class DBImpl : public DB {
   // it up.
   // State is protected with db mutex.
 
-  // 待copact的文件列表，保护以防误删  
+  // 待compact的文件列表，保护以防误删
   std::list<uint64_t> pending_outputs_;
 
+  // 记录需要清楚的文件信息
   // PurgeFileInfo is a structure to hold information of files to be deleted in
   // purge_queue_
   struct PurgeFileInfo {
@@ -1472,6 +1475,7 @@ class DBImpl : public DB {
   // A queue to store filenames of the files to be purged
   std::deque<PurgeFileInfo> purge_queue_;
 
+  // 用来记录已经分配确定的JobContext的文件号，当前只跟踪sst
   // A vector to store the file numbers that have been assigned to certain
   // JobContext. Current implementation tracks ssts only.
   std::vector<uint64_t> files_grabbed_for_purge_;
@@ -1617,10 +1621,12 @@ class DBImpl : public DB {
   // Only to be set during initialization
   std::unique_ptr<PreReleaseCallback> recoverable_state_pre_release_callback_;
 
+  // 统计数据转存
   // handle for scheduling stats dumping at fixed intervals
   // REQUIRES: mutex locked
   std::unique_ptr<rocksdb::RepeatableThread> thread_dump_stats_;
 
+  // 统计数据快照
   // handle for scheduling stats snapshoting at fixed intervals
   // REQUIRES: mutex locked
   std::unique_ptr<rocksdb::RepeatableThread> thread_persist_stats_;
@@ -1632,7 +1638,7 @@ class DBImpl : public DB {
   // Background threads call this function, which is just a wrapper around
   // the InstallSuperVersion() function. Background threads carry
   // sv_context which can have new_superversion already
-  // allocated.
+  // allocated(后台线程携带已经分配好的sv_context信息).
   // All ColumnFamily state changes go through this function. Here we analyze
   // the new state and we schedule background work if we detect that the new
   // state needs flush or compaction.
@@ -1684,8 +1690,9 @@ class DBImpl : public DB {
   size_t GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
   Env::WriteLifeTimeHint CalculateWALWriteHint() { return Env::WLTH_SHORT; }
 
-  // When set, we use a separate queue for writes that dont write to memtable.
-  // In 2PC these are the writes at Prepare phase.
+  // When set, we use a separate(分离) queue for writes that dont write to memtable.
+  // In 2PC these are the writes at Prepare phase.(在两阶段提交协议中(准备阶段 + 提交阶段)，这些是准备阶段的写入)
+  // RocksDB支持二阶段提交(2PC)后，在prepare阶段写WAL, WriteBatch写memtable依然在commit阶段
   const bool two_write_queues_;
   const bool manual_wal_flush_;
   // Increase the sequence number after writing each batch, whether memtable is

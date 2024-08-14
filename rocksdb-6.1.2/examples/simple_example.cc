@@ -14,18 +14,22 @@ using namespace rocksdb;
 
 std::string kDBPath = "./test/rocksdb_simple_example";
 
-//https://leveldb-handbook.readthedocs.io/zh/latest/basic.html ¸ÅÄî¼òµ¥Ñ§Ï°
+//https://leveldb-handbook.readthedocs.io/zh/latest/basic.html ï¿½ï¿½ï¿½ï¿½ï¿½Ñ§Ï°
 int main() {
   DB* db;
   Options options;
   // Optimize RocksDB. This is the easiest way to get RocksDB to perform well
+
+  // è®¾ç½®compaction jobså¹¶è¡Œæ•°
   options.IncreaseParallelism();
+
+  // level compaction ä¼˜åŒ–
   options.OptimizeLevelStyleCompaction();
   // create the DB if it's not already present
   options.create_if_missing = true;
 
   // open DB
-  Status s = DB::Open(options, kDBPath, &db); //db¶ÔÓ¦DBImpl
+  Status s = DB::Open(options, kDBPath, &db); //dbï¿½ï¿½Ó¦DBImpl
   assert(s.ok());
 
   // Put key-value  DBImpl::put

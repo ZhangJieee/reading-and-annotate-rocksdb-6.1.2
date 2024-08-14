@@ -425,7 +425,11 @@ void WritePreparedTxnDB::AddPrepared(uint64_t seq) {
   TEST_SYNC_POINT("AddPrepared::begin:pause");
   TEST_SYNC_POINT("AddPrepared::begin:resume");
   WriteLock wl(&prepared_mutex_);
+
+  // record in prepared_txns_
   prepared_txns_.push(seq);
+
+  // 对比剔除的最大committed id，小于的会转移到delay prepared
   auto new_max = future_max_evicted_seq_.load();
   if (UNLIKELY(seq <= new_max)) {
     // This should not happen in normal case
@@ -455,6 +459,8 @@ void WritePreparedTxnDB::AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,
     ROCKS_LOG_DETAILS(info_log_,
                       "Evicting %" PRIu64 ",%" PRIu64 " with max %" PRIu64,
                       evicted.prep_seq, evicted.commit_seq, prev_max);
+
+    // 确认是否需要更新max_evicted_seq_
     if (prev_max < evicted.commit_seq) {
       auto last = db_impl_->GetLastPublishedSequence();  // could be 0
       SequenceNumber max_evicted_seq;
@@ -472,11 +478,17 @@ void WritePreparedTxnDB::AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,
                         " => %lu",
                         prepare_seq, evicted.prep_seq, evicted.commit_seq,
                         prev_max, max_evicted_seq);
+
+      // 这里更新max_evicted_seq_用的是commit seq
       AdvanceMaxEvictedSeq(prev_max, max_evicted_seq);
     }
+
     // After each eviction from commit cache, check if the commit entry should
     // be kept around because it overlaps with a live snapshot.
+    // 需要确认evicted的事务是否需要继续记录到old_commit_map_中，通过判断和存在的快照是否重叠
     CheckAgainstSnapshots(evicted);
+
+    // evicted的事务是否存在于delayed_prepared_中，存在则将其追加到delayed_prepared_中
     if (UNLIKELY(!delayed_prepared_empty_.load(std::memory_order_acquire))) {
       WriteLock wl(&prepared_mutex_);
       for (auto dp : delayed_prepared_) {
@@ -581,6 +593,8 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
   // it has not already. Otherwise the new snapshot is when we ask DB for
   // snapshots smaller than future max.
   auto updated_future_max = prev_max;
+
+  // 先更新future_max_evicted_seq_
   while (updated_future_max < new_max &&
          !future_max_evicted_seq_.compare_exchange_weak(
              updated_future_max, new_max, std::memory_order_acq_rel,
@@ -588,6 +602,7 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
   };
 
   {
+    // 这里根据新的max_evicted_seq进行事务迁移
     WriteLock wl(&prepared_mutex_);
     CheckPreparedAgainstMax(new_max);
   }
@@ -599,15 +614,21 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
   SequenceNumber new_snapshots_version = new_max;
   std::vector<SequenceNumber> snapshots;
   bool update_snapshots = false;
+
+  // 考虑到快照有更新
   if (new_snapshots_version > snapshots_version_) {
     // This is to avoid updating the snapshots_ if it already updated
-    // with a more recent vesion by a concrrent thread
+    // with a more recent vesion by a concrrent thread(如果它早被别的线程更新到最新的快照了，则不更新)
     update_snapshots = true;
     // We only care about snapshots lower then max
+
+    // 从DB中取小于new_max的快照
     snapshots = GetSnapshotListFromDB(new_max);
   }
   if (update_snapshots) {
     UpdateSnapshots(snapshots, new_snapshots_version);
+
+    // 这里将新取到的快照list(也就是小于new_max的快照)都放入到old_commit_map中
     if (!snapshots.empty()) {
       WriteLock wl(&old_commit_map_mutex_);
       for (auto snap : snapshots) {
@@ -618,6 +639,8 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
       old_commit_map_empty_.store(false, std::memory_order_release);
     }
   }
+
+  // 最后更新max_evicted_seq_
   auto updated_prev_max = prev_max;
   TEST_SYNC_POINT("AdvanceMaxEvictedSeq::update_max:pause");
   TEST_SYNC_POINT("AdvanceMaxEvictedSeq::update_max:resume");
@@ -644,6 +667,8 @@ SnapshotImpl* WritePreparedTxnDB::GetSnapshotInternal(
   // the value that would be obtained otherwise atomically. That is ok since
   // this optimization works as long as min_uncommitted is less than or equal
   // than the smallest uncommitted seq when the snapshot was taken.
+
+  // 最小未提交事务ID
   auto min_uncommitted = WritePreparedTxnDB::SmallestUnCommittedSeq();
   SnapshotImpl* snap_impl = db_impl_->GetSnapshotImpl(for_ww_conflict_check);
   assert(snap_impl);
@@ -789,6 +814,8 @@ void WritePreparedTxnDB::UpdateSnapshots(
 #endif
   ROCKS_LOG_DETAILS(info_log_, "snapshots_mutex_ overhead");
   WriteLock wl(&snapshots_mutex_);
+
+  // 更新快照版本
   snapshots_version_ = version;
   // We update the list concurrently with the readers.
   // Both new and old lists are sorted and the new list is subset of the
@@ -803,6 +830,8 @@ void WritePreparedTxnDB::UpdateSnapshots(
   // afterwards.
   size_t i = 0;
   auto it = snapshots.begin();
+
+  // 将新取到的快照list放入到cache中
   for (; it != snapshots.end() && i < SNAPSHOT_CACHE_SIZE; it++, i++) {
     snapshot_cache_[i].store(*it, std::memory_order_release);
     TEST_IDX_SYNC_POINT("WritePreparedTxnDB::UpdateSnapshots:p:", ++sync_i);
@@ -817,6 +846,8 @@ void WritePreparedTxnDB::UpdateSnapshots(
   }
 #endif
   snapshots_.clear();
+
+  // 接着上面的，多出来的部分放在这里
   for (; it != snapshots.end(); it++) {
     // Insert them to a vector that is less efficient to access
     // concurrently
@@ -828,6 +859,8 @@ void WritePreparedTxnDB::UpdateSnapshots(
 
   // Note: this must be done after the snapshots data structures are updated
   // with the new list of snapshots.
+
+  // 根据新取到的快照列表，将释放掉除此之外的所有快照信息
   CleanupReleasedSnapshots(snapshots, snapshots_all_);
   snapshots_all_ = snapshots;
 

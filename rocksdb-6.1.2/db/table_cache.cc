@@ -122,6 +122,7 @@ Status TableCache::GetTableReader(
             record_read_stats ? ioptions_.statistics : nullptr, SST_READ_MICROS,
             file_read_hist, ioptions_.rate_limiter, for_compaction,
             ioptions_.listeners));
+
 	//RocksDB会根据我们配置的不同的sst格式来调用不同的reader,而在RocksDB中默认的格式是基于block.
 	//参考NewBlockBasedTableFactory  tablereader就是一个BlockBasedTable对象(假设使用了基于block的sst format).
     s = ioptions_.table_factory->NewTableReader(
@@ -154,6 +155,8 @@ Status TableCache::FindTable(const EnvOptions& env_options,
                              bool prefetch_index_and_filter_in_cache) {
   PERF_TIMER_GUARD_WITH_ENV(find_table_nanos, ioptions_.env);
   Status s;
+
+  // 从TableCache中获取目标SST的FileReader,没有则走IO读并更新cache
   uint64_t number = fd.GetNumber();
   Slice key = GetSliceForFileNumber(&number);
   *handle = cache_->Lookup(key);
@@ -161,9 +164,12 @@ Status TableCache::FindTable(const EnvOptions& env_options,
                            const_cast<bool*>(&no_io));
 
   if (*handle == nullptr) {
+      // 配置禁IO操作
     if (no_io) {  // Don't do IO and return a not-found status
       return Status::Incomplete("Table not found in table_cache, no_io is set");
     }
+
+    // 这里读取SST文件Meta并写入table cache
     std::unique_ptr<TableReader> table_reader;
     s = GetTableReader(env_options, internal_comparator, fd,
                        false /* sequential mode */, 0 /* readahead */,
@@ -388,7 +394,11 @@ Status TableCache::Get(const ReadOptions& options,
   //在对应的sst文件读取对应的key的值,这里可以看到每一个fd都包含了一个TableReader的结构，
   //这个结构就是用来保存文件的内容.而我们的table_cache主要就是缓存这个结构.
   if (!done && s.ok()) {//row_cache中没找到，则在对应的sst读取传递进来的key.
+
+    // 目标SST没有cache对应的FileReader，走IO读
     if (t == nullptr) {
+
+        // TableCache::FindTable
       s = FindTable(
           env_options_, internal_comparator, fd, &handle, prefix_extractor,
           options.read_tier == kBlockCacheTier /* no_io */,
@@ -397,6 +407,7 @@ Status TableCache::Get(const ReadOptions& options,
         t = GetTableReaderFromHandle(handle);
       }
     }
+
     SequenceNumber* max_covering_tombstone_seq =
         get_context->max_covering_tombstone_seq();
     if (s.ok() && max_covering_tombstone_seq != nullptr &&
@@ -413,7 +424,9 @@ Status TableCache::Get(const ReadOptions& options,
       //读取完毕TableReader之后，RocksDB就需要从sst文件中get key了,也就是最终的key查找方式是
       //在每个sst format class的Get方法中实现的。
       get_context->SetReplayLog(row_cache_entry);  // nullptr if no cache.
+
       //这里的get也就是对应的sst format的get.
+      // 默认这里的TableReader类型是BlockBasedTable，接口BlockBasedTable::Get
       s = t->Get(options, k, get_context, prefix_extractor, skip_filters);
       get_context->SetReplayLog(nullptr);
     } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {

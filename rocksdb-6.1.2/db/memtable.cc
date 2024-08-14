@@ -664,6 +664,7 @@ struct Saver {
 //则就是我们在SkipListRep::iterator::seek->InlineSkipList<>::Iterator::Seek中定
 //位到的位置.这个函数要做的比较简单，首先就是判断是否得到的key和我们传递进来的key相同，
 //如果不同，则说明查找的key不合法，因此直接返回.这里我们着重来看对于插入和删除的处理.
+// 如果是查找到对应的值，则设置found_final_value并返回用户;如果是Delete，则设置status为NotFound
 
 //第一个参数是之前保存的Saver对象，第二个则就是我们在skiplist中定位到的位置
 //MemTable::Get->MemTableRep::Get

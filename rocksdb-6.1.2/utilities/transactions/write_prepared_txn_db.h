@@ -36,7 +36,7 @@ namespace rocksdb {
 
 // A PessimisticTransactionDB that writes data to DB after prepare phase of 2PC.
 // In this way some data in the DB might not be committed. The DB provides
-// mechanisms to tell such data apart from committed data.
+// mechanisms to tell such data apart from committed data(write prepared policy，用来区分memtable中未提交和已提交的数据).
 class WritePreparedTxnDB : public PessimisticTransactionDB {
  public:
   explicit WritePreparedTxnDB(DB* db,
@@ -131,6 +131,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
           prep_seq, snapshot_seq, 1);
       return true;
     }
+
+    // 快照 < 事务提交seq，表示未来的事务，不可见
     if (snapshot_seq < prep_seq) {
       // snapshot_seq < prep_seq <= commit_seq => snapshot_seq < commit_seq
       ROCKS_LOG_DETAILS(
@@ -138,6 +140,9 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
           prep_seq, snapshot_seq, 0);
       return false;
     }
+
+    // min_uncommitted: 最小未提交事务seq(当前快照下的)
+    // 事务提交seq < min_uncommitted,表示该事务已提交,可见
     if (prep_seq < min_uncommitted) {
       ROCKS_LOG_DETAILS(info_log_,
                         "IsInSnapshot %" PRIu64 " in %" PRIu64
@@ -146,19 +151,45 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
                         prep_seq, snapshot_seq, 1, min_uncommitted);
       return true;
     }
-    // Commit of delayed prepared has two non-atomic steps: add to commit cache,
-    // remove from delayed prepared. Our reads from these two is also
+
+    // Commit of delayed prepared(保存的是未提交事务) has two non-atomic steps: add to commit cache,
+    // remove from delayed prepared.(delayed prepared中事务的提交是有两个非原子操作:添加到commit cache，从delayed prepared中移除) Our reads from these two is also
     // non-atomic. By looking into commit cache first thus we might not find the
-    // prep_seq neither in commit cache not in delayed_prepared_. To fix that i)
+    // prep_seq neither in commit cache not in delayed_prepared_.(先观察commit cache的话，可能不会在commit cache和delayed_prepared_中找到prep_seq) To fix that i)
     // we check if there was any delayed prepared BEFORE looking into commit
-    // cache, ii) if there was, we complete the search steps to be these: i)
-    // commit cache, ii) delayed prepared, commit cache again. In this way if
+    // cache(先检查是否存在delayed prepared), ii) if there was, we complete the search steps to be these: i)
+    // commit cache, ii) delayed prepared, commit cache again.(2次添加已提交事务到commit cache) In this way if
     // the first query to commit cache missed the commit, the 2nd will catch it.
+
+    // 这里简单理解就是delayed prepared阶段的是事务提交需要两次操作:添加到commit cache和从delayed prepared中移除。
+    // 如果先查询commit cache在查询delayed prepared的话，可能会漏掉，这时需要在查询一次commit cache来避免这个情况。
+    // FIXME 这里如果是deplayed prepared和commit cache的转换，那delayed_prepared_commits_这个是干什么用的
     bool was_empty;
+
+    // 最大已提交的事务准备序列
     SequenceNumber max_evicted_seq_lb, max_evicted_seq_ub;
     CommitEntry64b dont_care;
+
+    // prep_seq在commit cache中的索引位置
     auto indexed_seq = prep_seq % COMMIT_CACHE_SIZE;
     size_t repeats = 0;
+
+    /*
+     * 这里do-while的处理流程如下(循环条件是,1和5读出来值不相等，如果1 != 5，则意味着在读commit cache期间发生evict,新的已提交事务加进来,淘汰事务会更新max_evicted_seq_,prepared_txns_(最小堆)中小于max_evicted_seq_的事务会写到delayed_prepared)
+     * 1.读max_evicted_seq_
+     * 2.判断delayed_prepared是否未空
+     * 3.commit cache取出对应事务seq
+     * 4.如果存在且没有被覆盖，则比较commit seq和快照seq确定是否可见
+     * 5.再读max_evicted_seq_,这里如果和1的值不相等，直接continue(表示1-5之间有新的事务已被提交,旧事务被淘汰)
+     * 6.如果max_evicted_seq_ < prepare_seq，则表示要么存在于commit cache；要么不存在
+     * 7.如果delayed_prepared 不为空:
+     *      1)读锁
+     *      2)如果不存在于delayed_prepared中，则再次执行3、4、5步骤(catch)(这里可能发生delayed_prepared刚好commit,需要再次读取确认) (这里5之后，如果在4-5之间有新事务提交，旧事务被淘汰会更新max_evicted_seq_,则符合do-while循环条件进入下一次循环)
+     *      3)如果存在，则再判断是否存在于delayed_prepared_commits中，存在则比较commit seq和快照seq确定是否可见.否则是未提交
+     *
+     *  max_evicted_seq_发生变动，则需要检查commit cache是否有目标事务提交。
+     *  同样在检查完commit cache后读max_evicted_seq_的两步操作同样不是原子，则需要再次确认是否发生变动
+     * */
     do {
       repeats++;
       assert(repeats < 100);
@@ -167,20 +198,28 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
             "The read was intrupted 100 times by update to max_evicted_seq_. "
             "This is unexpected in all setups");
       }
+
+      // 取出最大淘汰的事务准备序列
       max_evicted_seq_lb = max_evicted_seq_.load(std::memory_order_acquire);
       TEST_SYNC_POINT(
           "WritePreparedTxnDB::IsInSnapshot:max_evicted_seq_:pause");
       TEST_SYNC_POINT(
           "WritePreparedTxnDB::IsInSnapshot:max_evicted_seq_:resume");
+
+      // delayed_prepared_是否空标志
       was_empty = delayed_prepared_empty_.load(std::memory_order_acquire);
       TEST_SYNC_POINT(
           "WritePreparedTxnDB::IsInSnapshot:delayed_prepared_empty_:pause");
       TEST_SYNC_POINT(
           "WritePreparedTxnDB::IsInSnapshot:delayed_prepared_empty_:resume");
       CommitEntry cached;
+
+      // 从commit cache中取出indexed_seq对应的commit entry
       bool exist = GetCommitEntry(indexed_seq, &dont_care, &cached);
       TEST_SYNC_POINT("WritePreparedTxnDB::IsInSnapshot:GetCommitEntry:pause");
       TEST_SYNC_POINT("WritePreparedTxnDB::IsInSnapshot:GetCommitEntry:resume");
+
+      // 存在且是本事务，即已提交
       if (exist && prep_seq == cached.prep_seq) {
         // It is committed and also not evicted from commit cache
         ROCKS_LOG_DETAILS(
@@ -194,11 +233,13 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       // commit, or never committed.
 
       // At this point we dont know if it was committed or it is still prepared
+      // 注意，这个点又取了一次(max_evicted_seq_是从commit cache淘汰出来的事务，已经提交，但不确定在这个快照下是否是提交状态)
       max_evicted_seq_ub = max_evicted_seq_.load(std::memory_order_acquire);
-      if (UNLIKELY(max_evicted_seq_lb != max_evicted_seq_ub)) {
+      if (UNLIKELY(max_evicted_seq_lb != max_evicted_seq_ub)) {  //这里分支预测，几乎不存在不相等的情况
         continue;
       }
       // Note: max_evicted_seq_ when we did GetCommitEntry <= max_evicted_seq_ub
+      // 序列比max_evicted_seq_大，表示两种情况，要么存在于commit cache，已提交了(这个上面已经判断过了)；要么不存在，未提交
       if (max_evicted_seq_ub < prep_seq) {
         // Not evicted from cache and also not present, so must be still
         // prepared
@@ -211,17 +252,25 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       TEST_SYNC_POINT("WritePreparedTxnDB::IsInSnapshot:prepared_mutex_:pause");
       TEST_SYNC_POINT(
           "WritePreparedTxnDB::IsInSnapshot:prepared_mutex_:resume");
+
+      // delayed_prepared_不为空
       if (!was_empty) {
         // We should not normally reach here
         WPRecordTick(TXN_PREPARE_MUTEX_OVERHEAD);
+
+        // 读锁
         ReadLock rl(&prepared_mutex_);
         ROCKS_LOG_WARN(
             info_log_, "prepared_mutex_ overhead %" PRIu64 " for %" PRIu64,
             static_cast<uint64_t>(delayed_prepared_.size()), prep_seq);
+
+        // 存在
         if (delayed_prepared_.find(prep_seq) != delayed_prepared_.end()) {
           // This is the order: 1) delayed_prepared_commits_ update, 2) publish
           // 3) delayed_prepared_ clean up. So check if it is the case of a late
-          // clenaup.
+          // cleanup.
+
+          // uncommitted
           auto it = delayed_prepared_commits_.find(prep_seq);
           if (it == delayed_prepared_commits_.end()) {
             // Then it is not committed yet
@@ -236,11 +285,14 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
                               " commit: %" PRIu64 " returns %" PRId32,
                               prep_seq, snapshot_seq, it->second,
                               snapshot_seq <= it->second);
-            return it->second <= snapshot_seq;
+            return it->second <= snapshot_seq; // 确认已提交的事务对快照可见
           }
         } else {
           // 2nd query to commit cache. Refer to was_empty comment above.
+          // 再次从commit cache中取出indexed_seq对应的commit entry
           exist = GetCommitEntry(indexed_seq, &dont_care, &cached);
+
+          // 存在
           if (exist && prep_seq == cached.prep_seq) {
             ROCKS_LOG_DETAILS(
                 info_log_,
@@ -251,15 +303,21 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
           max_evicted_seq_ub = max_evicted_seq_.load(std::memory_order_acquire);
         }
       }
-    } while (UNLIKELY(max_evicted_seq_lb != max_evicted_seq_ub));
+    } while (UNLIKELY(max_evicted_seq_lb != max_evicted_seq_ub)); //这里分支预测，几乎不存在不相等的情况
     // When advancing max_evicted_seq_, we move older entires from prepared to
     // delayed_prepared_. Also we move evicted entries from commit cache to
-    // old_commit_map_ if it overlaps with any snapshot. Since prep_seq <=
+    // old_commit_map_ if it overlaps(重叠) with any snapshot. Since prep_seq <=
     // max_evicted_seq_, we have three cases: i) in delayed_prepared_, ii) in
-    // old_commit_map_, iii) committed with no conflict with any snapshot. Case
-    // (i) delayed_prepared_ is checked above
+    // old_commit_map_, iii) committed with no conflict with any snapshot.
+    // 当max_evicted_seq_有变动后，将老的准备事务添加到delayed_prepared_中
+    // 因为执行到这里,prep_seq <= max_evicted_seq_的状态,有三个场景:
+    // delayed_prepared_: 上面已经确认过，不存在
+    // old_commit_map_:   当commit cache发生evicted时,对于某个快照不可见的话，会将其存放到这个map中，以key -> list形式存储，key表示对应快照.
+    // 已提交对于任意快照可见: 已提交，可见
+
+    // Case (i) delayed_prepared_ is checked above
     if (max_evicted_seq_ub < snapshot_seq) {  // then (ii) cannot be the case
-      // only (iii) is the case: committed
+      // only (iii) is the case: committed  //这里如果快照是大于max_evicted_seq_ub的，即Case 2的map存储的事务一定都是可见的，因为被evicted出来的一定都是小于max_evicted_seq_ub且已提交的快照
       // commit_seq <= max_evicted_seq_ < snapshot_seq => commit_seq <
       // snapshot_seq
       ROCKS_LOG_DETAILS(
@@ -270,6 +328,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     // else (ii) might be the case: check the commit data saved for this
     // snapshot. If there was no overlapping commit entry, then it is committed
     // with a commit_seq lower than any live snapshot, including snapshot_seq.
+    // old_commit_map,保存当前snapshot下的uncommitted的事务列表,为空则一定提交，可见的，见L312的分析
     if (old_commit_map_empty_.load(std::memory_order_acquire)) {
       ROCKS_LOG_DETAILS(info_log_,
                         "IsInSnapshot %" PRIu64 " in %" PRIu64
@@ -282,6 +341,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       *snap_released = true;
       return true;
     }
+
+    //针对很老的快照处理
     {
       // We should not normally reach here unless sapshot_seq is old. This is a
       // rare case and it is ok to pay the cost of mutex ReadLock for such old,
@@ -290,6 +351,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       ReadLock rl(&old_commit_map_mutex_);
       auto prep_set_entry = old_commit_map_.find(snapshot_seq);
       bool found = prep_set_entry != old_commit_map_.end();
+
+      // 如果存在某个快照，寻找对应目标的事务seq是否存在
       if (found) {
         auto& vec = prep_set_entry->second;
         found = std::binary_search(vec.begin(), vec.end(), prep_seq);
@@ -299,6 +362,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
                           "IsInSnapshot %" PRIu64 " in %" PRIu64
                           " returns %" PRId32 " released=1",
                           prep_seq, snapshot_seq, 0);
+
+        // snapshot不存在，需要设置标志
         // This snapshot is not valid anymore. We cannot tell if prep_seq is
         // committed before or after the snapshot. Return true but also set
         // snap_released to true.
@@ -307,6 +372,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
         return true;
       }
 
+      // 不存在于目标快照的list中,则意味着对应的事务已经提交，可见
       if (!found) {
         ROCKS_LOG_DETAILS(info_log_,
                           "IsInSnapshot %" PRIu64 " in %" PRIu64
@@ -316,6 +382,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       }
     }
     // (ii) it the case: it is committed but after the snapshot_seq
+    // 这里接着L375的逻辑，如果found，意味着事务已提交，但是对于当前快照是未提交，不可见
     ROCKS_LOG_DETAILS(
         info_log_, "IsInSnapshot %" PRIu64 " in %" PRIu64 " returns %" PRId32,
         prep_seq, snapshot_seq, 0);
@@ -324,9 +391,11 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   // Add the transaction with prepare sequence seq to the prepared list.
   // Note: must be called serially with increasing seq on each call.
+  // 新事务会先加入到prepared txns中，并尝试是否需要CheckPreparedAgainstMax
   void AddPrepared(uint64_t seq);
   // Check if any of the prepared txns are less than new max_evicted_seq_. Must
   // be called with prepared_mutex_ write locked.
+  // 将prepared txns中小于max_evicted_seq_的事务转移到delay prepared中
   void CheckPreparedAgainstMax(SequenceNumber new_max);
   // Remove the transaction with prepare sequence seq from the prepared list
   void RemovePrepared(const uint64_t seq, const size_t batch_cnt = 1);
@@ -490,6 +559,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   // A heap with the amortized O(1) complexity for erase. It uses one extra heap
   // to keep track of erased entries that are not yet on top of the main heap.
+  // 为了方便删除O(1)，这里用了额外一个堆来维护，等到erased_heap_.top的值小于等于heap_时则直接删除
   class PreparedHeap {
     std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>>
         heap_;
@@ -571,6 +641,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // concurrently. The concurrent invocations of this function is equivalent to
   // a serial invocation in which the last invocation is the one with the
   // largest new_max value.
+
+  // 更新max_evicted_seq_到更大的值，同时更新prepared txns和old_map_commit
   void AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
                             const SequenceNumber& new_max);
 
@@ -637,6 +709,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // commit_seq. Return false if checking the next snapshot(s) is not needed.
   // This is the case if none of the next snapshots could satisfy the condition.
   // next_is_larger: the next snapshot will be a larger value
+
+  // 这里调用的时机在新的事务被提交后，考虑到对于live snapshot的应用，针对与之重叠的事务需要记录到old_commit_map_中
   bool MaybeUpdateOldCommitMap(const uint64_t& prep_seq,
                                const uint64_t& commit_seq,
                                const uint64_t& snapshot_seq,
@@ -671,6 +745,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   // A heap of prepared transactions. Thread-safety is provided with
   // prepared_mutex_.
+  // 新准备事物序列先加入到这里
   PreparedHeap prepared_txns_;
   const size_t COMMIT_CACHE_BITS;
   const size_t COMMIT_CACHE_SIZE;
@@ -681,13 +756,14 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // The largest evicted *commit* sequence number from the commit_cache_. If a
   // seq is smaller than max_evicted_seq_ is might or might not be present in
   // commit_cache_. So commit_cache_ must first be checked before consulting
-  // with max_evicted_seq_.
+  // with(查看) max_evicted_seq_.
   std::atomic<uint64_t> max_evicted_seq_ = {};
   // Order: 1) update future_max_evicted_seq_ = new_max, 2)
   // GetSnapshotListFromDB(new_max), max_evicted_seq_ = new_max. Since
-  // GetSnapshotInternal guarantess that the snapshot seq is larger than
+  // GetSnapshotInternal guarantess(保证) that the snapshot seq is larger than
   // future_max_evicted_seq_, this guarantes that if a snapshot is not larger
   // than max has already being looked at via a GetSnapshotListFromDB(new_max).
+  // 既然是担保人(保证) 快照seq大于B，这保证了如果快照不大于max，则已通过C查看。
   std::atomic<uint64_t> future_max_evicted_seq_ = {};
   // Advance max_evicted_seq_ by this value each time it needs an update. The
   // larger the value, the less frequent advances we would have. We do not want
@@ -701,11 +777,16 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // because it is no longer in the commit_cache_. The vector must be sorted
   // after each update.
   // Thread-safety is provided with old_commit_map_mutex_.
-  std::map<SequenceNumber, std::vector<SequenceNumber>> old_commit_map_;
+  std::map<SequenceNumber, std::vector<SequenceNumber>> old_commit_map_; //保存的是对于某个快照来说不可见的事务
+
+  // 记录在max_evicted_seq_之前的prepared的事务序列
   // A set of long-running prepared transactions that are not finished by the
   // time max_evicted_seq_ advances their sequence number. This is expected to
   // be empty normally. Thread-safety is provided with prepared_mutex_.
   std::set<uint64_t> delayed_prepared_;
+
+  // 这个用来区分unprepared的事务和已经提交没有清理的事务,个人理解delayed_prepared_中后来commit的事务会加到commit cache中,并更新delayed_prepared_commits_
+  // 这个缓存可能会定期清理(FIXME 需要确认下,可参考L268)
   // Commit of a delayed prepared: 1) update commit cache, 2) update
   // delayed_prepared_commits_, 3) publish seq, 3) clean up delayed_prepared_.
   // delayed_prepared_commits_ will help us tell apart the unprepared txns from

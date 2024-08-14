@@ -350,6 +350,7 @@ Status WritableFileWriter::Flush() {
     }
   }
 
+  // Only Flush to OS Cache，No Sync
   s = writable_file_->Flush();
 
   if (!s.ok()) {
@@ -420,6 +421,8 @@ Status WritableFileWriter::SyncInternal(bool use_fsync) {
   TEST_SYNC_POINT("WritableFileWriter::SyncInternal:0");
   auto prev_perf_level = GetPerfLevel();
   IOSTATS_CPU_TIMER_GUARD(cpu_write_nanos, env_);
+
+  // Fsync() 和 Sync()的区别，两个分别调用了fsync和fdatasync的接口，FIXME研究下两个区别
   if (use_fsync) {
     s = writable_file_->Fsync();
   } else {

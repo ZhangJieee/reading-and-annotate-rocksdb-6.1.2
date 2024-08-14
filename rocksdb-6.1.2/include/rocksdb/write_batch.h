@@ -198,7 +198,7 @@ class WriteBatch : public WriteBatchBase {
 
     // default implementation will just call Put without column family for
     // backwards compatibility. If the column family is not default,
-    // the function is noop
+    // the function is noop(¿Õ²Ù×÷)
     virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                          const Slice& value) {
       if (column_family_id == 0) {

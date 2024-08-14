@@ -194,6 +194,8 @@ class FilePicker {
           // Setup file search bound for the next level based on the
           // comparison results
           if (curr_level_ > 0) {
+
+            //  通过FileIndexed获取下一个level的sst查找区间
             file_indexer_->GetNextLevelIndex(curr_level_,
                                             curr_index_in_curr_level_,
                                             cmp_smallest, cmp_largest,
@@ -1226,6 +1228,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }
 
   PinnedIteratorsManager pinned_iters_mgr;
+
+  //GetContext类结构, 根据传递进来的文件元信息来查找对应的key
   GetContext get_context(
       user_comparator(), merge_operator_, info_log_, db_statistics_,
       status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
@@ -1237,6 +1241,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr.StartPinning();
   }
 
+  // FilePicker类结构, 根据传递进来的key查找对应的File
   FilePicker fp(
       storage_info_.files_, user_key, ikey, &storage_info_.level_files_brief_,
       storage_info_.num_non_empty_levels_, &storage_info_.file_indexer_,
@@ -1263,7 +1268,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         get_perf_context()->per_level_perf_context_enabled;
     StopWatchNano timer(env_, timer_enabled /* auto_start */);
 
-	//TableCache::Get,
+	//TableCache::Get,做两个事情，查找kv和更新row cache
     *status = table_cache_->Get(
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_.prefix_extractor.get(),

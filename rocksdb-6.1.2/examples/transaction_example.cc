@@ -54,6 +54,7 @@ int main() {
   // Write a key OUTSIDE of this transaction.
   // Does not affect txn since this is an unrelated key.  If we wrote key 'abc'
   // here, the transaction would fail to commit.
+  // 如果写abc，则出现不可重复读问题
   s = txn_db->Put(write_options, "xyz", "zzz");
 
   // Commit transaction
@@ -80,6 +81,7 @@ int main() {
 
   // Attempt to read a key using the snapshot.  This will fail since
   // the previous write outside this txn conflicts with this read.
+  // 出现幻读
   read_options.snapshot = snapshot;
   s = txn->GetForUpdate(read_options, "abc", &value);
   assert(s.IsBusy());
@@ -93,13 +95,13 @@ int main() {
 
   ////////////////////////////////////////////////////////
   //
-  // "Read Committed" (Monotonic Atomic Views) Example
+  // "Read Committed" (Monotonic Atomic Views(单调原子视角)) Example
   //   --Using multiple Snapshots
   //
   ////////////////////////////////////////////////////////
 
   // In this example, we set the snapshot multiple times.  This is probably
-  // only necessary if you have very strict isolation requirements to
+  // only necessary if you have very strict isolation(隔离) requirements to
   // implement.
 
   // Set a snapshot at start of transaction

@@ -142,6 +142,9 @@ struct SavePoints {
 
 WriteBatch::WriteBatch(size_t reserved_bytes, size_t max_bytes)
     : save_points_(nullptr), content_flags_(0), max_bytes_(max_bytes), rep_() {
+
+  //  WriteBatchInternal::kHeader = 12
+  //  | 8B(seq number) | 4B(count) |
   rep_.reserve((reserved_bytes > WriteBatchInternal::kHeader) ?
     reserved_bytes : WriteBatchInternal::kHeader);
   rep_.resize(WriteBatchInternal::kHeader);
@@ -415,6 +418,8 @@ memtable insert堆栈信息:
 
 //写memtable的handler为MemTableInserter
 Status WriteBatch::Iterate(Handler* handler) const {
+
+  // rep_为实际写入的内容
   Slice input(rep_);
   if (input.size() < WriteBatchInternal::kHeader) {
     return Status::Corruption("malformed WriteBatch (too small)");
@@ -462,6 +467,7 @@ Status WriteBatch::Iterate(Handler* handler) const {
       s = Status::OK();
     }
 
+    // 根据之前塞进来的flag来判断如何insert
     switch (tag) {
       case kTypeColumnFamilyValue:
       case kTypeValue:
@@ -665,8 +671,10 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
   }
 
   LocalSavePoint save(b);
+
+  // 将count值写入WriteBatch  (4B)
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
-  //填充类型
+  //填充类型 FIXME 0？  (1B)
   if (column_family_id == 0) {
     b->rep_.push_back(static_cast<char>(kTypeValue));
   } else {
@@ -675,6 +683,8 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
   }
   PutLengthPrefixedSlice(&b->rep_, key);
   PutLengthPrefixedSlice(&b->rep_, value);
+
+  // 添加 PUT flag
   b->content_flags_.store(
       b->content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_PUT,
       std::memory_order_relaxed);
